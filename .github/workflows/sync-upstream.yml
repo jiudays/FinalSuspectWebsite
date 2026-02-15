@@ -1,0 +1,152 @@
+name: Sync Upstream Code
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 每天 UTC 时间 4:00 (北京时间 12:00)
+  workflow_dispatch:        # 手动触发
+
+permissions:
+  contents: write          # 允许写入代码和创建 tag
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    # 步骤1：设置重试策略（最多尝试3次）
+    strategy:
+      max-parallel: 1      # 串行执行，避免冲突
+      fail-fast: false      # 即使失败也继续尝试
+    
+    steps:
+      # 步骤2：检出代码
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      # 步骤3：配置 Git 用户
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      
+      # 步骤4：添加上游仓库
+      - name: Add Upstream Remote
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/NewLezaiYa/FinalSuspectWebsite.git
+          git fetch upstream
+      
+      # 步骤5：检测并尝试同步（带重试机制）
+      - name: Sync with Upstream (with retry)
+        id: sync
+        run: |
+          CURRENT_BRANCH=$(git branch --show-current)
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          SYNC_SUCCESS=false
+          
+          # 先检测是否有更新
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/$CURRENT_BRANCH 2>/dev/null || echo "0")
+          
+          if [ "$BEHIND_COUNT" -eq "0" ]; then
+            echo "✅ 已是最新，无需同步"
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "has_updates=true" >> $GITHUB_OUTPUT
+          echo "🔄 发现上游有 $BEHIND_COUNT 个新提交，开始同步（最多重试 $MAX_RETRIES 次）"
+          
+          # 开始重试循环
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SYNC_SUCCESS" = false ]; do
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            
+            if [ $RETRY_COUNT -gt 1 ]; then
+              echo "🔄 第 $RETRY_COUNT 次重试..."
+              sleep 5  # 重试前等待5秒
+              git fetch upstream  # 重新获取最新状态
+            fi
+            
+            # 尝试合并
+            if git merge --no-edit upstream/$CURRENT_BRANCH; then
+              # 尝试推送
+              if git push origin $CURRENT_BRANCH; then
+                SYNC_SUCCESS=true
+                echo "✅ 第 $RETRY_COUNT 次尝试成功同步"
+                echo "sync_success=true" >> $GITHUB_OUTPUT
+              else
+                echo "❌ 第 $RETRY_COUNT 次推送失败"
+                # 回退合并
+                git reset --hard HEAD@{1}
+              fi
+            else
+              echo "❌ 第 $RETRY_COUNT 次合并失败"
+              # 中止合并
+              git merge --abort
+            fi
+          done
+          
+          # 如果最终失败，记录错误信息
+          if [ "$SYNC_SUCCESS" = false ]; then
+            echo "❌ 所有 $MAX_RETRIES 次尝试均失败"
+            echo "sync_success=false" >> $GITHUB_OUTPUT
+            
+            # 获取错误时间
+            ERROR_TIME=$(date '+%Y-%m-%d_%H:%M:%S')
+            echo "error_time=$ERROR_TIME" >> $GITHUB_OUTPUT
+            
+            # 获取错误详情
+            {
+              echo "error_details<<EOF"
+              echo "同步失败时间: $ERROR_time"
+              echo "失败次数: $MAX_RETRIES"
+              echo "当前分支: $CURRENT_BRANCH"
+              echo "上游仓库: [UPSTREAM-OWNER]/[UPSTREAM-REPO]"
+              echo "落后提交数: $BEHIND_COUNT"
+              echo ""
+              echo "Git 状态:"
+              git status --short
+              echo ""
+              echo "最近提交:"
+              git log -3 --oneline
+              EOF
+            } >> $GITHUB_OUTPUT
+          fi
+      
+      # 步骤6：如果同步失败，创建错误日志并打 tag
+      - name: Create Error Tag and Log
+        if: steps.sync.outputs.sync_success == 'false' && steps.sync.outputs.has_updates == 'true'
+        run: |
+          # 创建日志目录
+          mkdir -p error-logs
+          
+          # 生成日志文件名（使用传入的时间）
+          LOG_FILE="error-logs/${{ steps.sync.outputs.error_time }}.log"
+          
+          # 写入错误详情
+          cat > "$LOG_FILE" << 'EOF'
+          ${{ steps.sync.outputs.error_details }}
+          EOF
+          
+          # 提交日志文件
+          git add "$LOG_FILE"
+          git commit -m "chore: add error log for failed sync at ${{ steps.sync.outputs.error_time }}"
+          
+          # 创建错误 tag（格式：action_error/YYYY-MM-DD_HH-MM-SS）
+          TAG_NAME="action_error/${{ steps.sync.outputs.error_time }}"
+          git tag -a "$TAG_NAME" -m "Sync failed at ${{ steps.sync.outputs.error_time }}"
+          
+          # 推送提交和 tag
+          git push origin HEAD --tags
+          
+          echo "📝 错误日志已创建: $LOG_FILE"
+          echo "🏷️ 错误标签已创建: $TAG_NAME"
+      
+      # 步骤7：可选 - 发送失败通知（如果需要）
+      - name: Send Failure Notification
+        if: failure() || (steps.sync.outputs.sync_success == 'false' && steps.sync.outputs.has_updates == 'true')
+        run: |
+          echo "⚠️ 同步失败，请检查 error-logs 目录下的日志文件和 action_error tag"
+          # 如果需要邮件通知，可以在这里添加
